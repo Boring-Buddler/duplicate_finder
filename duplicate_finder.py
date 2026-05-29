@@ -3,9 +3,16 @@ from __future__ import annotations
 import csv
 import os
 import re
+import shutil
+import sys
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from typing import Dict, List, Tuple
+
+
+def _resource(relative: str) -> str:
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, relative)
 
 try:
     from tkinterdnd2 import DND_FILES, TkinterDnD
@@ -197,8 +204,9 @@ class _PanelFrame(ttk.LabelFrame):
 # ---------------------------------------------------------------------------
 
 class _ResultsFrame(ttk.Frame):
-    def __init__(self, parent: tk.Widget) -> None:
+    def __init__(self, parent: tk.Widget, on_copy_missing=None) -> None:
         super().__init__(parent)
+        self._on_copy_missing = on_copy_missing
         self.columnconfigure(0, weight=1)
         self.rowconfigure(0, weight=1)
 
@@ -225,6 +233,7 @@ class _ResultsFrame(ttk.Frame):
         btn_frame.grid(row=1, column=0, sticky="ew", padx=4, pady=(2, 4))
         ttk.Button(btn_frame, text="In Zwischenablage kopieren", command=self._copy).pack(side="left", padx=4)
         ttk.Button(btn_frame, text="Als CSV speichern", command=self._save_csv).pack(side="left", padx=4)
+        ttk.Button(btn_frame, text="Fehlende Dateien kopieren →", command=self._trigger_copy).pack(side="left", padx=4)
 
         self._data_dupes: List[Tuple] = []
         self._data_only_a: List[Tuple] = []
@@ -291,6 +300,10 @@ class _ResultsFrame(ttk.Frame):
             self._nb.select(tabs[1])
         else:
             self._nb.select(tabs[2])
+
+    def _trigger_copy(self) -> None:
+        if self._on_copy_missing:
+            self._on_copy_missing(self._nb.index(self._nb.select()))
 
     def _active_data(self) -> List[Tuple]:
         idx = self._nb.index(self._nb.select())
@@ -366,7 +379,7 @@ class DuplicateFinderApp:
         results_outer.columnconfigure(0, weight=1)
         results_outer.rowconfigure(0, weight=1)
 
-        self._results = _ResultsFrame(results_outer)
+        self._results = _ResultsFrame(results_outer, on_copy_missing=self._copy_missing_files)
         self._results.grid(row=0, column=0, sticky="nsew")
 
         pw.add(results_outer, weight=1)
@@ -380,6 +393,49 @@ class DuplicateFinderApp:
     def set_status(self, text: str) -> None:
         self._status_var.set(text)
         self._root.update_idletasks()
+
+    def _copy_missing_files(self, tab_idx: int) -> None:
+        if tab_idx == 0:
+            data = self._results._data_only_a
+            dest_hint = [p for p in self._panel_b._paths if os.path.isdir(p)]
+            label = "Liste 1 → Liste 2"
+        elif tab_idx == 1:
+            data = self._results._data_only_b
+            dest_hint = [p for p in self._panel_a._paths if os.path.isdir(p)]
+            label = "Liste 2 → Liste 1"
+        else:
+            messagebox.showinfo("Hinweis", "Bitte einen 'Nur in Liste'-Tab auswählen.")
+            return
+
+        if not data:
+            messagebox.showinfo("Hinweis", "Keine fehlenden Dateien vorhanden.")
+            return
+
+        initial = dest_hint[0] if len(dest_hint) == 1 else None
+        dest_dir = filedialog.askdirectory(title=f"Zielordner wählen ({label})", initialdir=initial)
+        if not dest_dir:
+            return
+
+        if not messagebox.askyesno("Bestätigung", f"{len(data)} Datei(en) nach\n{dest_dir}\nkopieren?"):
+            return
+
+        errors: List[str] = []
+        copied = 0
+        for name, src in data:
+            if src and os.path.isfile(src):
+                try:
+                    shutil.copy2(src, dest_dir)
+                    copied += 1
+                except Exception as exc:
+                    errors.append(f"{name}: {exc}")
+            else:
+                errors.append(f"{name}: Quelldatei nicht gefunden")
+
+        if errors:
+            detail = "\n".join(errors[:10]) + ("…" if len(errors) > 10 else "")
+            messagebox.showwarning("Teilerfolg", f"{copied} von {len(data)} Datei(en) kopiert.\n\nFehler:\n{detail}")
+        else:
+            messagebox.showinfo("Fertig", f"{copied} Datei(en) erfolgreich kopiert.")
 
     def _run_compare(self) -> None:
         map_a = self._panel_a.get_file_map()
@@ -397,12 +453,28 @@ class DuplicateFinderApp:
         )
 
 
+def _apply_icon(root: tk.Tk) -> None:
+    ico = _resource(os.path.join("assets", "kirschke.ico"))
+    png = _resource(os.path.join("assets", "favicon.png"))
+    try:
+        root.iconbitmap(default=ico)
+    except Exception:
+        pass
+    try:
+        img = tk.PhotoImage(file=png)
+        root.wm_iconphoto(True, img)
+    except Exception:
+        pass
+
+
 def main() -> None:
     if _DND_OK:
         root = TkinterDnD.Tk()
     else:
         root = tk.Tk()
+    _apply_icon(root)
     DuplicateFinderApp(root)
+    root.after(0, lambda: _apply_icon(root))
     root.mainloop()
 
 
