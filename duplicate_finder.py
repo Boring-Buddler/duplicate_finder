@@ -45,6 +45,78 @@ def _scan_paths(paths: List[str]) -> Dict[str, List[str]]:
     return result
 
 
+def _scan_paths_with_folders(paths: List[str]) -> Tuple[Dict[str, List[str]], Dict[str, List[str]]]:
+    """Return (file_map, folder_map) where file_map is {filename_lower: [full_path, ...]} 
+    and folder_map is {folder_path_lower: [full_path, ...]}."""
+    file_map: Dict[str, List[str]] = {}
+    folder_map: Dict[str, List[str]] = {}
+    
+    for root_path in paths:
+        root_path = root_path.strip()
+        if os.path.isfile(root_path):
+            name = os.path.basename(root_path).lower()
+            file_map.setdefault(name, []).append(root_path)
+        elif os.path.isdir(root_path):
+            # Add the root folder itself
+            folder_key = root_path.lower()
+            folder_map.setdefault(folder_key, []).append(root_path)
+            
+            for dirpath, dirnames, filenames in os.walk(root_path):
+                # Filter out hidden directories
+                dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+                
+                # Add subfolder to folder_map
+                folder_key = dirpath.lower()
+                folder_map.setdefault(folder_key, []).append(dirpath)
+                
+                # Add files
+                for fname in filenames:
+                    if fname.startswith("."):
+                        continue
+                    name = fname.lower()
+                    full = os.path.join(dirpath, fname)
+                    file_map.setdefault(name, []).append(full)
+    
+    return file_map, folder_map
+
+
+def _find_missing_folders(
+    map_a: Dict[str, List[str]],
+    map_b: Dict[str, List[str]],
+    folder_map_a: Dict[str, List[str]],
+    folder_map_b: Dict[str, List[str]],
+) -> Tuple[List[str], List[str]]:
+    """Find folders that exist in one list but not in the other.
+    Returns (folders_only_in_a, folders_only_in_b)."""
+    folders_a = set(folder_map_a.keys())
+    folders_b = set(folder_map_b.keys())
+    
+    # Check which folders from A don't exist in B
+    only_a_folders = []
+    for folder_path in folders_a:
+        # Check if any part of this folder structure exists in B
+        found = False
+        for folder_path_b in folders_b:
+            if folder_path in folder_path_b or folder_path_b in folder_path:
+                found = True
+                break
+        if not found:
+            only_a_folders.append(folder_path)
+    
+    # Check which folders from B don't exist in A
+    only_b_folders = []
+    for folder_path in folders_b:
+        found = False
+        for folder_path_a in folders_a:
+            if folder_path in folder_path_a or folder_path_a in folder_path:
+                found = True
+                break
+        if not found:
+            only_b_folders.append(folder_path)
+    
+    return sorted(only_a_folders), sorted(only_b_folders)
+
+
 def _compare(
     names_a: Dict[str, List[str]],
     names_b: Dict[str, List[str]],
@@ -64,6 +136,7 @@ class _PanelFrame(ttk.LabelFrame):
         self._app = app
         self._paths: List[str] = []
         self._file_map: Dict[str, List[str]] = {}
+        self._folder_map: Dict[str, List[str]] = {}
 
         self.columnconfigure(0, weight=1)
         self.rowconfigure(3, weight=1)
@@ -189,14 +262,30 @@ class _PanelFrame(ttk.LabelFrame):
 
     def _rescan(self) -> None:
         self._app.set_status("Scanne…")
-        self._file_map = _scan_paths(self._paths)
+        self._file_map, self._folder_map = _scan_paths_with_folders(self._paths)
         self._tree.delete(*self._tree.get_children())
-        for name_lower, full_paths in sorted(self._file_map.items()):
+        
+        # Group files by their parent folder for hierarchical display
+        files_by_folder: Dict[str, List[str]] = {}
+        for name_lower, full_paths in self._file_map.items():
             for fp in full_paths:
-                self._tree.insert("", "end", values=(os.path.basename(fp), fp))
+                folder = os.path.dirname(fp)
+                if folder not in files_by_folder:
+                    files_by_folder[folder] = []
+                files_by_folder[folder].append(fp)
+        
+        # Display files grouped by folder
+        for folder in sorted(files_by_folder.keys()):
+            folder_node = self._tree.insert("", "end", text="📁 " + os.path.basename(folder), values=("", folder))
+            for fp in sorted(files_by_folder[folder]):
+                self._tree.insert(folder_node, "end", values=(os.path.basename(fp), fp))
+        
         total = sum(len(v) for v in self._file_map.values())
         self._count_var.set(f"Dateien gefunden: {total}")
         self._app.set_status("Bereit")
+    
+    def get_folder_map(self) -> Dict[str, List[str]]:
+        return self._folder_map
 
 
 # ---------------------------------------------------------------------------
@@ -263,6 +352,10 @@ class _ResultsFrame(ttk.Frame):
         only_b: List[str],
         map_a: Dict[str, List[str]],
         map_b: Dict[str, List[str]],
+        folder_map_a: Dict[str, List[str]] = None,
+        folder_map_b: Dict[str, List[str]] = None,
+        missing_folders_a: List[str] = None,
+        missing_folders_b: List[str] = None,
     ) -> None:
         for tree in (self._tree_dupes, self._tree_only_a, self._tree_only_b):
             tree.delete(*tree.get_children())
@@ -270,6 +363,17 @@ class _ResultsFrame(ttk.Frame):
         self._data_only_a.clear()
         self._data_only_b.clear()
 
+        # Handle folder maps if provided
+        if folder_map_a is None:
+            folder_map_a = {}
+        if folder_map_b is None:
+            folder_map_b = {}
+        if missing_folders_a is None:
+            missing_folders_a = []
+        if missing_folders_b is None:
+            missing_folders_b = []
+
+        # Populate duplicates tab
         for name in dupes:
             for pa in map_a.get(name, [""]):
                 for pb in map_b.get(name, [""]):
@@ -277,21 +381,59 @@ class _ResultsFrame(ttk.Frame):
                     self._tree_dupes.insert("", "end", values=(display, pa, pb))
                     self._data_dupes.append((display, pa, pb))
 
+        # Populate only_a tab with hierarchical structure
+        if missing_folders_a:
+            # Add missing folders section
+            folders_node = self._tree_only_a.insert("", "end", text="📁 Fehlende Ordner", values=("[ORDNER]", ""))
+            for folder in sorted(missing_folders_a):
+                self._tree_only_a.insert(folders_node, "end", text=os.path.basename(folder), values=("", folder))
+                self._data_only_a.append((os.path.basename(folder), folder, "FOLDER"))
+        
+        # Add files from only_a grouped by folder
+        files_by_folder: Dict[str, List[Tuple[str, str]]] = {}
         for name in only_a:
             for p in map_a.get(name, [""]):
+                folder = os.path.dirname(p)
                 display = os.path.basename(p) if p else name
-                self._tree_only_a.insert("", "end", values=(display, p))
+                if folder not in files_by_folder:
+                    files_by_folder[folder] = []
+                files_by_folder[folder].append((display, p))
+        
+        # Sort folders and add to tree
+        for folder in sorted(files_by_folder.keys()):
+            folder_node = self._tree_only_a.insert("", "end", text="📁 " + os.path.basename(folder), values=("[ORDNER]", folder))
+            for display, p in sorted(files_by_folder[folder]):
+                self._tree_only_a.insert(folder_node, "end", text=display, values=(display, p))
                 self._data_only_a.append((display, p))
 
+        # Populate only_b tab with hierarchical structure
+        if missing_folders_b:
+            # Add missing folders section
+            folders_node = self._tree_only_b.insert("", "end", text="📁 Fehlende Ordner", values=("[ORDNER]", ""))
+            for folder in sorted(missing_folders_b):
+                self._tree_only_b.insert(folders_node, "end", text=os.path.basename(folder), values=("", folder))
+                self._data_only_b.append((os.path.basename(folder), folder, "FOLDER"))
+        
+        # Add files from only_b grouped by folder
+        files_by_folder_b: Dict[str, List[Tuple[str, str]]] = {}
         for name in only_b:
             for p in map_b.get(name, [""]):
+                folder = os.path.dirname(p)
                 display = os.path.basename(p) if p else name
-                self._tree_only_b.insert("", "end", values=(display, p))
+                if folder not in files_by_folder_b:
+                    files_by_folder_b[folder] = []
+                files_by_folder_b[folder].append((display, p))
+        
+        # Sort folders and add to tree
+        for folder in sorted(files_by_folder_b.keys()):
+            folder_node = self._tree_only_b.insert("", "end", text="📁 " + os.path.basename(folder), values=("[ORDNER]", folder))
+            for display, p in sorted(files_by_folder_b[folder]):
+                self._tree_only_b.insert(folder_node, "end", text=display, values=(display, p))
                 self._data_only_b.append((display, p))
 
         tabs = self._nb.tabs()
-        self._nb.tab(tabs[0], text=f"Nur in Liste 1 ({len(self._data_only_a)})")
-        self._nb.tab(tabs[1], text=f"Nur in Liste 2 ({len(self._data_only_b)})")
+        self._nb.tab(tabs[0], text=f"Nur in Liste 1 ({len([x for x in self._data_only_a if len(x) == 2 or (len(x) == 3 and x[2] != 'FOLDER')])}")
+        self._nb.tab(tabs[1], text=f"Nur in Liste 2 ({len([x for x in self._data_only_b if len(x) == 2 or (len(x) == 3 and x[2] != 'FOLDER')])}")
         self._nb.tab(tabs[2], text=f"Duplikate ({len(self._data_dupes)})")
 
         if self._data_only_a:
@@ -407,8 +549,12 @@ class DuplicateFinderApp:
             messagebox.showinfo("Hinweis", "Bitte einen 'Nur in Liste'-Tab auswählen.")
             return
 
-        if not data:
-            messagebox.showinfo("Hinweis", "Keine fehlenden Dateien vorhanden.")
+        # Filter out folder entries (they have 3 elements with 'FOLDER' marker)
+        file_data = [x for x in data if len(x) == 2 or (len(x) == 3 and x[2] != 'FOLDER')]
+        folder_data = [x for x in data if len(x) == 3 and x[2] == 'FOLDER']
+        
+        if not file_data and not folder_data:
+            messagebox.showinfo("Hinweis", "Keine fehlenden Dateien oder Ordner vorhanden.")
             return
 
         initial = dest_hint[0] if len(dest_hint) == 1 else None
@@ -416,12 +562,19 @@ class DuplicateFinderApp:
         if not dest_dir:
             return
 
-        if not messagebox.askyesno("Bestätigung", f"{len(data)} Datei(en) nach\n{dest_dir}\nkopieren?"):
+        total_items = len(file_data) + len(folder_data)
+        if not messagebox.askyesno("Bestätigung", f"{total_items} Element(e) nach\n{dest_dir}\nkopieren?"):
             return
 
         errors: List[str] = []
         copied = 0
-        for name, src in data:
+        
+        # Copy files
+        for item in file_data:
+            if len(item) == 2:
+                name, src = item
+            else:
+                continue
             if src and os.path.isfile(src):
                 try:
                     shutil.copy2(src, dest_dir)
@@ -430,16 +583,32 @@ class DuplicateFinderApp:
                     errors.append(f"{name}: {exc}")
             else:
                 errors.append(f"{name}: Quelldatei nicht gefunden")
+        
+        # Copy folders (recursively)
+        for item in folder_data:
+            name, src, _ = item
+            if src and os.path.isdir(src):
+                try:
+                    dest_folder = os.path.join(dest_dir, name)
+                    shutil.copytree(src, dest_folder, dirs_exist_ok=True)
+                    copied += 1
+                except Exception as exc:
+                    errors.append(f"[Ordner] {name}: {exc}")
+            else:
+                errors.append(f"[Ordner] {name}: Quellenordner nicht gefunden")
 
         if errors:
             detail = "\n".join(errors[:10]) + ("…" if len(errors) > 10 else "")
-            messagebox.showwarning("Teilerfolg", f"{copied} von {len(data)} Datei(en) kopiert.\n\nFehler:\n{detail}")
+            messagebox.showwarning("Teilerfolg", f"{copied} von {total_items} Element(en) kopiert.\n\nFehler:\n{detail}")
         else:
-            messagebox.showinfo("Fertig", f"{copied} Datei(en) erfolgreich kopiert.")
+            messagebox.showinfo("Fertig", f"{copied} Element(e) erfolgreich kopiert.")
 
     def _run_compare(self) -> None:
         map_a = self._panel_a.get_file_map()
         map_b = self._panel_b.get_file_map()
+        folder_map_a = self._panel_a.get_folder_map()
+        folder_map_b = self._panel_b.get_folder_map()
+        
         if not map_a and not map_b:
             messagebox.showinfo(
                 "Hinweis", "Bitte zuerst Dateien oder Ordner in die Listen laden."
@@ -447,9 +616,10 @@ class DuplicateFinderApp:
             return
         self.set_status("Vergleiche…")
         dupes, only_a, only_b = _compare(map_a, map_b)
-        self._results.populate(dupes, only_a, only_b, map_a, map_b)
+        missing_folders_a, missing_folders_b = _find_missing_folders(map_a, map_b, folder_map_a, folder_map_b)
+        self._results.populate(dupes, only_a, only_b, map_a, map_b, folder_map_a, folder_map_b, missing_folders_a, missing_folders_b)
         self.set_status(
-            f"{len(dupes)} Duplikat(e) gefunden  |  Nur in Liste 1: {len(only_a)}  |  Nur in Liste 2: {len(only_b)}"
+            f"{len(dupes)} Duplikat(e) gefunden  |  Nur in Liste 1: {len(only_a)}  |  Nur in Liste 2: {len(only_b)}  |  Fehlende Ordner: {len(missing_folders_a)} / {len(missing_folders_b)}"
         )
 
 
